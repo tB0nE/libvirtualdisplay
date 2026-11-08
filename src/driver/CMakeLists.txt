@@ -166,6 +166,11 @@ if(WIN32 AND BUILD_VIRTUALDISPLAY_TOOLS)
     add_executable(virtualdisplay_broker "${PROJECT_SOURCE_DIR}/tools/virtualdisplay_broker.cpp")
     target_link_libraries(virtualdisplay_broker PRIVATE libvirtualdisplay::driver advapi32 userenv wtsapi32)
     target_compile_features(virtualdisplay_broker PRIVATE cxx_std_20)
+    if(MINGW)
+        # Runs as a LocalSystem service from a folder of its own: link the MinGW runtime in
+        # so it needs no loose DLLs there (the service silently fails to start without them).
+        target_link_options(virtualdisplay_broker PRIVATE -static)
+    endif()
     install(TARGETS virtualdisplay_broker RUNTIME DESTINATION tools)
     list(APPEND _libvirtualdisplay_tool_targets virtualdisplay_broker)
 
