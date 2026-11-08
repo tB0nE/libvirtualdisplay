@@ -144,7 +144,9 @@ namespace virtual_display::driver {
     // D:P            -> DACL, protected (no inherited ACEs)
     // (A;;GA;;;SY)   -> allow GENERIC_ALL to LocalSystem
     // (A;;GA;;;<sid>)-> allow GENERIC_ALL to the broker service
-    return "D:P(A;;GA;;;SY)(A;;GA;;;" + derive_service_sid(kBrokerServiceName) + ")";
+    // IU (Interactive Users) allows non-elevated host processes (e.g. Vibepollo
+    // launched by a user-mode tray app) to open the control interface directly.
+    return "D:P(A;;GA;;;SY)(A;;GA;;;" + derive_service_sid(kBrokerServiceName) + ")(A;;GA;;;IU)";
   }
 
   std::string protocol_version_string() {

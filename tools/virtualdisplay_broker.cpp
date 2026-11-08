@@ -36,10 +36,12 @@ namespace vdd = virtual_display::driver;
 namespace {
   constexpr const wchar_t *kServiceName = vdd::kBrokerServiceNameW.data();
   constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\SunshineVirtualDisplayBroker";
-  constexpr wchar_t kPipeSecurityDescriptor[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+  // IU (Interactive Users) allows Vibepollo to connect when running non-elevated
+  // as the interactively logged-in user, which is Meteor's launch model.
+  constexpr wchar_t kPipeSecurityDescriptor[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
   constexpr wchar_t kBrokerStateSubkey[] = L"SOFTWARE\\Sunshine\\VirtualDisplayBroker";
   constexpr wchar_t kBrokerDisplayManifestValue[] = L"DisplayManifest";
-  constexpr wchar_t kBrokerRegistrySecurityDescriptor[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+  constexpr wchar_t kBrokerRegistrySecurityDescriptor[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)";
   constexpr wchar_t kSessionHelperExecutable[] = L"virtualdisplay_probe.exe";
   constexpr DWORD kPipeBufferBytes = 4096;
   constexpr DWORD kPipeClientReadTimeoutMs = 5000;
