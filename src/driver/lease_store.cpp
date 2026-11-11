@@ -235,7 +235,8 @@ namespace virtual_display::driver {
         identity_display_id,
         next_temporary_display_generation_++,
         false,
-        validated.request.hdr_max_luminance_nits
+        validated.request.hdr_max_luminance_nits,
+        (validated.request.flags & kCreateTemporaryDisplayFlagRequestedResolutionOnly) != 0
       }
     );
 
@@ -346,6 +347,26 @@ namespace virtual_display::driver {
     displays_by_id_.erase(display);
     remove_lease_if_empty(request.lease_id);
     return {};
+  }
+
+  std::optional<TemporaryDisplayRecord> DisplayStore::authorize_temporary_display_owner(
+    const LeaseDisplayRequest &request,
+    const OwnerCapability &owner_capability,
+    const std::chrono::steady_clock::time_point now
+  ) const {
+    if (validate_lease_display_request(request) != ValidationError::None) {
+      return std::nullopt;
+    }
+    const auto display = displays_by_id_.find(request.display_id);
+    const auto lease = leases_by_id_.find(request.lease_id);
+    if (display == displays_by_id_.end() || lease == leases_by_id_.end() ||
+        display->second.lease_id != request.lease_id || display->second.pending_departure ||
+        lease->second.expires_at <= now || display->second.expires_at <= now ||
+        !lease->second.owner_capability ||
+        !owner_capabilities_equal(*lease->second.owner_capability, owner_capability)) {
+      return std::nullopt;
+    }
+    return display->second;
   }
 
   StoreResult DisplayStore::abandon_pending_temporary_display(

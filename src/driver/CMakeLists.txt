@@ -10,8 +10,17 @@ add_library(${MODULE_ALIAS} ALIAS ${MODULE})
 target_include_directories(${MODULE} PUBLIC include)
 target_compile_features(${MODULE} PUBLIC cxx_std_20)
 
+option(LIBVIRTUALDISPLAY_ENABLE_FRAME_TRANSPORT
+        "Enable the experimental IddCx frame-push producer and registration IOCTLs" OFF)
+if(LIBVIRTUALDISPLAY_ENABLE_FRAME_TRANSPORT)
+    target_compile_definitions(${MODULE} PUBLIC VDD_ENABLE_FRAME_TRANSPORT=1)
+endif()
+
 if(WIN32)
-    target_link_libraries(${MODULE} PRIVATE setupapi)
+    target_link_libraries(${MODULE} PRIVATE setupapi d3d11 dxgi)
+    # Both the Windows SDK and MinGW provide the umbrella import library;
+    # kernelbase.lib is absent on some MSVC/SDK installations.
+    target_link_libraries(${MODULE} PRIVATE onecore)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -32,6 +41,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     find_package(PkgConfig REQUIRED)
     include(GNUInstallDirs)
     pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_DRM REQUIRED IMPORTED_TARGET libdrm)
+    pkg_check_modules(LIBVIRTUALDISPLAY_KWIN_GBM REQUIRED IMPORTED_TARGET gbm)
 
     add_library(vibeshine_kwin_gpu SHARED
             "${LIBVIRTUALDISPLAY_LINUX_ROOT}/kwin_gpu_interposer.cpp")
@@ -40,7 +50,28 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND BUILD_VIBESHINE_KWIN_GPU_BRIDGE AND
     target_compile_features(vibeshine_kwin_gpu PRIVATE cxx_std_20)
     target_link_libraries(vibeshine_kwin_gpu PRIVATE
             PkgConfig::LIBVIRTUALDISPLAY_KWIN_DRM
+            PkgConfig::LIBVIRTUALDISPLAY_KWIN_GBM
             ${CMAKE_DL_LIBS})
+
+    # New KWin allocators need a software-allocation scope as well as GBM
+    # routing. Build that shim only against installed public KWin headers and
+    # bind it at runtime to the exact corresponding library, never a guessed ABI.
+    find_package(Qt6 COMPONENTS Core QUIET)
+    find_path(LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR core/graphicsbufferallocator.h PATH_SUFFIXES kwin)
+    find_library(LIBVIRTUALDISPLAY_KWIN_LIBRARY kwin)
+    if(Qt6Core_FOUND AND LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR AND LIBVIRTUALDISPLAY_KWIN_LIBRARY)
+        get_filename_component(_kwin_library_real "${LIBVIRTUALDISPLAY_KWIN_LIBRARY}" REALPATH)
+        get_filename_component(_kwin_library_name "${_kwin_library_real}" NAME)
+        # This is the reviewed GraphicsBufferOptions layout. New minor versions
+        # remain on the native safe path until their allocator contract is reviewed.
+        if(_kwin_library_name MATCHES "^libkwin\\.so\\.6\\.8\\.[0-9]+$")
+            target_include_directories(vibeshine_kwin_gpu PRIVATE "${LIBVIRTUALDISPLAY_KWIN_INCLUDE_DIR}")
+            target_link_libraries(vibeshine_kwin_gpu PRIVATE Qt6::Core)
+            target_compile_definitions(vibeshine_kwin_gpu PRIVATE
+                    VIBESHINE_KWIN_NATIVE_ALLOCATOR=1
+                    VIBESHINE_KWIN_NATIVE_LIBRARY_NAME="${_kwin_library_name}")
+        endif()
+    endif()
 
     # The distro KWin binary carries cap_sys_nice, so the dynamic loader runs it
     # in secure-execution mode and ignores LD_PRELOAD paths. glibc's documented

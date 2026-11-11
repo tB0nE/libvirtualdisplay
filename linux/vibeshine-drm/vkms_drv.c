@@ -20,11 +20,9 @@
 #include <linux/fcntl.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
-#include <linux/panic.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/sync_file.h>
-#include <linux/timer.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_gem.h>
@@ -47,6 +45,7 @@
 #include "vkms_configfs.h"
 #include "vkms_drv.h"
 #include "vibeshine_drm_change.h"
+#include "vibeshine_drm_dumb.h"
 #include "vibeshine_drm_present.h"
 #include "vibeshine_drm_uapi.h"
 #include "vibeshine_drm_compat.h"
@@ -78,14 +77,6 @@ MODULE_PARM_DESC(enable_plane_pipeline, "Enable/Disable plane pipeline support")
 static bool create_default_dev = true;
 module_param_named(create_default_dev, create_default_dev, bool, 0444);
 MODULE_PARM_DESC(create_default_dev, "Create or not the default VKMS device");
-
-/*
- * Seconds a power-off or halt may spend in the kernel's device walk after the
- * reboot notifier before it is bugchecked into a restart. A restart never
- * waits at all; see vkms_reboot_notifier(). Filesystems are already synced and
- * unmounted or read-only at that point, so this only bounds the walk itself.
- */
-#define VKMS_POWEROFF_DEADLINE_SECS 5U
 
 DEFINE_DRM_GEM_FOPS(vkms_driver_fops);
 
@@ -321,6 +312,28 @@ static struct dma_buf *vkms_get_frame_dmabuf(struct drm_file *file_priv,
 	return dma_buf;
 }
 
+bool vkms_framebuffer_has_implicit_import(struct drm_framebuffer *fb)
+{
+	unsigned int i;
+
+	if (fb->flags & DRM_MODE_FB_MODIFIERS)
+		return false;
+	for (i = 0; i < fb->format->num_planes; ++i) {
+		struct drm_gem_object *obj = drm_gem_fb_get_obj(fb, i);
+
+		if (obj && obj->import_attach)
+			return true;
+	}
+	return false;
+}
+
+u64 vkms_framebuffer_modifier(struct drm_framebuffer *fb)
+{
+	/* Plain AddFB2's zero modifier does not describe imported storage. */
+	return vkms_framebuffer_has_implicit_import(fb) ?
+		DRM_FORMAT_MOD_INVALID : fb->modifier;
+}
+
 static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 				struct drm_file *file_priv)
 {
@@ -365,7 +378,7 @@ static int vkms_get_frame_ioctl(struct drm_device *dev, void *data,
 	request->width = fb->width;
 	request->height = fb->height;
 	request->fourcc = fb->format->format;
-	request->modifier = fb->modifier;
+	request->modifier = vkms_framebuffer_modifier(fb);
 	plane_count = fb->format->num_planes;
 	if (!plane_count || plane_count > VIBESHINE_DRM_FRAME_MAX_PLANES) {
 		ret = -EINVAL;
@@ -608,6 +621,7 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		struct drm_framebuffer *old_present_fb = NULL;
 		struct drm_plane_state *primary_state;
 		struct drm_crtc_state *crtc_state;
+		u64 presentation_timestamp_ns;
 		bool scanout_changed;
 
 		if (!vkms_commit_touches_crtc(state, crtc))
@@ -617,6 +631,8 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 		output = drm_crtc_to_vkms_output(crtc);
 		primary_state = drm_atomic_get_new_plane_state(state, crtc->primary);
 		crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+		presentation_timestamp_ns = vkms_crtc_take_present_timestamp(output,
+								     crtc_state);
 		if (primary_state && primary_state->fb && primary_state->visible) {
 			new_present_fb = primary_state->fb;
 			drm_framebuffer_get(new_present_fb);
@@ -631,7 +647,7 @@ static void vkms_signal_presented_crtcs(struct drm_atomic_commit *state)
 				output->present_fb = new_present_fb;
 				new_present_fb = NULL;
 			}
-			output->present_timestamp_ns = ktime_get_ns();
+			output->present_timestamp_ns = presentation_timestamp_ns;
 			completed_sequence = atomic64_inc_return(&output->present_sequence);
 			trace_event = &output->present_trace[(completed_sequence - 1) %
 							 VIBESHINE_DRM_TRACE_HISTORY_SIZE];
@@ -731,7 +747,7 @@ static const struct drm_driver vkms_driver = {
 	.fops			= &vkms_driver_fops,
 	.ioctls			= vkms_ioctls,
 	.num_ioctls		= ARRAY_SIZE(vkms_ioctls),
-	DRM_GEM_SHMEM_DRIVER_OPS,
+	VIBESHINE_DRM_SHMEM_DRIVER_OPS,
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 
 	.name			= DRIVER_NAME,
@@ -937,84 +953,6 @@ static const struct attribute_group vkms_device_attr_group = {
 	.attrs = vkms_device_attrs,
 };
 
-/*
- * The reboot notifier is the last point at which this module runs code with
- * the system still alive. Everything after it -- device_shutdown() of the
- * physical GPU drivers in particular -- runs on PID 1 with no timeout and no
- * way back to userspace. A GPU whose firmware has already faulted (NVIDIA
- * Xid 38 followed by a locked GPU is the observed case) makes that walk block
- * forever, and hardware watchdogs are not reliably present or functional.
- *
- * A restart therefore does not enter that walk at all: the notifier bugchecks
- * immediately. panic() records the failure through kmsg_dump()/pstore (and a
- * loaded crash kernel, if any) and then resets through the same emergency
- * path as SysRq-B. Filesystems are already synced and unmounted or read-only
- * by the time reboot notifiers run, so nothing is lost by skipping the walk.
- *
- * A power-off or halt still has to reach the firmware, so it is given a short
- * deadline instead. The timer keeps ticking while PID 1 is stuck in a driver
- * callback and bugchecks the same way, so a stuck power-off ends in a restart
- * rather than a hang, which is the recoverable outcome for a streaming host.
- */
-static void __noreturn vkms_bugcheck(const char *reason)
-{
-	/*
-	 * kernel.panic=0 would leave the panic sitting on the console forever,
-	 * which is the one outcome this path exists to prevent; -1 restarts
-	 * immediately. An explicit positive delay set by the administrator is
-	 * honoured.
-	 */
-	if (panic_timeout == 0)
-		panic_timeout = -1;
-	panic("vibeshine_drm: %s\n", reason);
-}
-
-static void vkms_shutdown_deadline_expired(struct timer_list *timer)
-{
-	(void)timer;
-	vkms_bugcheck("kernel power-off did not complete within the deadline");
-}
-
-static DEFINE_TIMER(vkms_shutdown_deadline_timer, vkms_shutdown_deadline_expired);
-
-static void vkms_arm_shutdown_deadline(void)
-{
-	DRM_INFO("bugchecking into a restart if kernel power-off exceeds %u s\n",
-		 VKMS_POWEROFF_DEADLINE_SECS);
-	mod_timer(&vkms_shutdown_deadline_timer,
-		  jiffies + secs_to_jiffies(VKMS_POWEROFF_DEADLINE_SECS));
-}
-
-/*
- * The restart bugcheck and the power-off deadline belong to the module, not
- * to a virtual device. A per-device notifier disappears with its device, so
- * a restart after the pool is removed (a deploy, a configfs teardown, or a
- * failed recreation) would walk straight into the physical GPU's shutdown
- * callback -- the hang this path exists to prevent. The higher priority runs
- * this before every per-device release below.
- */
-static int vkms_module_reboot_notifier(struct notifier_block *notifier,
-				       unsigned long action, void *data)
-{
-	(void)notifier;
-	(void)data;
-	if (action == SYS_RESTART)
-		vkms_bugcheck("restarting through bugcheck instead of the device shutdown walk");
-
-	/*
-	 * Arm before any device releases anything: drm_dev_unplug() sleeps in
-	 * synchronize_srcu(), and the deadline has to cover that too.
-	 */
-	vkms_arm_shutdown_deadline();
-
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block vkms_module_reboot_nb = {
-	.notifier_call = vkms_module_reboot_notifier,
-	.priority = 1,
-};
-
 static int vkms_reboot_notifier(struct notifier_block *notifier,
 				unsigned long action, void *data)
 {
@@ -1022,11 +960,10 @@ static int vkms_reboot_notifier(struct notifier_block *notifier,
 						    struct vkms_device,
 						    reboot_notifier);
 
+	(void)action;
 	(void)data;
-	/* The module notifier has already bugchecked a restart. */
-	if (action == SYS_RESTART)
-		return NOTIFY_DONE;
 
+	/* Release imported GPU buffers before the normal device shutdown walk. */
 	DRM_INFO("releasing virtual scanout before system shutdown\n");
 	vkms_shutdown_release(vkmsdev);
 
@@ -1128,13 +1065,9 @@ static int __init vkms_init(void)
 	int ret;
 	struct vkms_config *config;
 
-	ret = register_reboot_notifier(&vkms_module_reboot_nb);
-	if (ret)
-		return ret;
-
 	ret = vkms_configfs_register();
 	if (ret)
-		goto out_notifier;
+		return ret;
 
 	if (!create_default_dev)
 		return 0;
@@ -1158,8 +1091,6 @@ static int __init vkms_init(void)
 
 out_configfs:
 	vkms_configfs_unregister();
-out_notifier:
-	unregister_reboot_notifier(&vkms_module_reboot_nb);
 	return ret;
 }
 
@@ -1190,15 +1121,6 @@ static void __exit vkms_exit(void)
 		vkms_destroy(default_config);
 		vkms_config_destroy(default_config);
 	}
-
-	/*
-	 * Every per-device notifier is gone with its device; drop the module one
-	 * too, so nothing can re-arm the deadline. Then shut the timer down so an
-	 * unload during a shutdown that is still completing cannot leave a
-	 * callback behind.
-	 */
-	unregister_reboot_notifier(&vkms_module_reboot_nb);
-	timer_shutdown_sync(&vkms_shutdown_deadline_timer);
 }
 
 module_init(vkms_init);

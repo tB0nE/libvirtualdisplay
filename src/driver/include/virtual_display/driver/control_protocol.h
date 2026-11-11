@@ -33,7 +33,7 @@ namespace virtual_display::driver {
   };
 
   inline constexpr std::uint16_t kProtocolVersionMajor = 3;
-  inline constexpr std::uint16_t kProtocolVersionMinor = 7;
+  inline constexpr std::uint16_t kProtocolVersionMinor = 8;
   inline constexpr std::uint16_t kProtocolVersionPatch = 0;
   inline constexpr std::uint16_t kMinimumCompatibleProtocolVersionMinor = 6;
 
@@ -58,14 +58,19 @@ namespace virtual_display::driver {
   inline constexpr std::uint32_t kMinHdrMaxLuminanceNits = 400;
   inline constexpr std::uint32_t kMaxHdrMaxLuminanceNits = 2000;
   inline constexpr std::uint32_t kCreateTemporaryDisplayFlagEphemeralIdentity = 0x00000001u;
+  // Windows producer 3.8+: keep only the requested width/height in the catalog.
+  // This is immutable for the temporary display lifetime; zero preserves defaults.
+  inline constexpr std::uint32_t kCreateTemporaryDisplayFlagRequestedResolutionOnly = 0x00000002u;
   inline constexpr std::uint32_t kCreateTemporaryDisplayKnownFlags =
-    kCreateTemporaryDisplayFlagEphemeralIdentity;
+    kCreateTemporaryDisplayFlagEphemeralIdentity |
+    kCreateTemporaryDisplayFlagRequestedResolutionOnly;
   inline constexpr std::uint32_t kPermanentDisplayCountKnownFlags = 0;
   inline constexpr std::uint32_t kMaxDisplayStateEntries = 16;
   inline constexpr std::uint32_t kDisplayStateKindPermanent = 1;
   inline constexpr std::uint32_t kDisplayStateKindTemporary = 2;
   inline constexpr std::uint32_t kDisplayStateFlagHdrSupported = 0x00000001u;
   inline constexpr std::uint32_t kDisplayStateFlagRetainIdentity = 0x00000002u;
+  inline constexpr std::uint32_t kDisplayStateFlagRequestedResolutionOnly = 0x00000004u;
   inline constexpr std::uint32_t kDisplayManifestVersion = 3;
   inline constexpr std::uint32_t kMaxPermanentDisplayProfiles = 8;
   inline constexpr std::uint32_t kMaxAllowedModesPerProfile = 4;
@@ -96,6 +101,8 @@ namespace virtual_display::driver {
     SetRenderAdapter = 0x90b,
     CreateTemporaryDisplayOwned = 0x90c,
     ReclaimTemporaryDisplay = 0x90d,
+    QueryFrameTransportCapabilities = 0x90e,
+    QueryFrameTransportTarget = 0x911,
   };
 
   enum class IoctlAccess : std::uint32_t {
@@ -142,6 +149,33 @@ namespace virtual_display::driver {
     ioctl_code(IoctlFunction::CreateTemporaryDisplayOwned, IoctlAccess::ReadWrite);
   inline constexpr std::uint32_t kIoctlReclaimTemporaryDisplay =
     ioctl_code(IoctlFunction::ReclaimTemporaryDisplay, IoctlAccess::ReadWrite);
+  inline constexpr std::uint32_t kIoctlQueryFrameTransportCapabilities =
+    ioctl_code(IoctlFunction::QueryFrameTransportCapabilities, IoctlAccess::Read);
+  inline constexpr std::uint32_t kIoctlQueryFrameTransportTarget =
+    ioctl_code(IoctlFunction::QueryFrameTransportTarget, IoctlAccess::Read);
+
+  inline constexpr std::uint32_t kFrameTransportCapabilitiesVersion = 1;
+  inline constexpr std::uint16_t kFrameTransportCapabilitiesProtocolMinor = 8;
+  inline constexpr std::uint64_t kFrameTransportCapabilityKeyedMutexRing = 1;
+  inline constexpr std::uint32_t kFrameRingSlotCount = 4;
+
+  // A protocol version alone never promises a working GPU transport. The native
+  // capability is exposed only by an explicitly enabled build containing the
+  // importer, producer, and teardown path; the feature remains disabled by
+  // default and still requires Windows/WDK/GPU qualification. Existing display
+  // control requests are unchanged.
+  struct FrameTransportCapabilities {
+    Guid api_namespace {kApiNamespaceGuid};
+    std::uint32_t version {kFrameTransportCapabilitiesVersion};
+    std::uint32_t size {sizeof(FrameTransportCapabilities)};
+    std::uint64_t capabilities {};
+    std::uint32_t max_ring_slots {};
+    std::uint32_t reserved {};
+  };
+
+  static_assert(std::is_standard_layout_v<FrameTransportCapabilities>);
+  static_assert(sizeof(FrameTransportCapabilities) == 40);
+  static_assert(offsetof(FrameTransportCapabilities, capabilities) == 24);
 
   struct ProtocolVersion {
     Guid api_namespace {kApiNamespaceGuid};
@@ -150,6 +184,12 @@ namespace virtual_display::driver {
     std::uint16_t patch {kProtocolVersionPatch};
     std::uint16_t reserved {};
   };
+
+  // Version-gate the additive Windows create flag against the actual producer.
+  inline constexpr bool supports_requested_resolution_catalog(const ProtocolVersion &version) {
+    return version.api_namespace == kApiNamespaceGuid &&
+           version.major == kProtocolVersionMajor && version.minor >= 8;
+  }
 
   struct AdapterLuid {
     std::uint32_t low_part {};

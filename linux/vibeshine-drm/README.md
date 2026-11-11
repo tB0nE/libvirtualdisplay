@@ -24,6 +24,15 @@ monitor contract:
 - an independent `/sys/kernel/config/vibeshine-drm` configfs namespace, so the
   driver can coexist with a distribution's normal `vkms` module.
 
+Each connector's configfs `drm_name` attribute is read-only and reports the
+instantiated DRM connector name. DRM virtual connector type IDs are global
+across DRM devices, while configfs `Virtual-N` names identify pool-local slots.
+The broker resolves public DRM names through `drm_name` before changing status,
+requested modes, or leases; it fails closed if the loaded module lacks this
+attribute or if the mapping is missing or ambiguous. Updating the driver source
+does not update an already-loaded module; the new attribute becomes available
+after the updated driver is loaded, which may require a reboot.
+
 ## Presentation and frame-export ABI
 
 `vibeshine_drm_uapi.h` defines `DRM_VIBESHINE_WAIT_PRESENT`. Each CRTC owns a
@@ -40,6 +49,12 @@ another refresh-period wait based on its previous publication timestamp.
 Otherwise worker scheduling delays accumulate in a second clock and stall
 subsequent commits near maximum refresh. Capture independently selects the
 newest completed frame at the stream's delivery rate.
+
+Presentation timestamps are latched per commit from the DRM vblank which
+completes that commit's flip. Publication still waits for flip completion,
+but worker wakeup delays and later periodic vblanks do not rewrite the source
+timestamp. Immediate/no-event commits retain their completion time; if a flip
+wait times out without a recorded event, publication time is the fallback.
 
 The response also reports when a newer atomic state has been submitted but is
 not presented yet. Capture waits until that pending count reaches zero before
@@ -61,10 +76,9 @@ atomic quiesce after userspace has exited but before physical GPU devices shut
 down. This two-phase ordering prevents both a live-compositor unplug and stale
 imported DMA-BUF references crossing into NVIDIA teardown.
 
-The restart bugcheck and power-off deadline are registered once for the loaded
-module, not per virtual device, so they still apply after a deploy or configfs
-teardown has removed every device. That module notifier runs before the
-per-device releases.
+Restart, power-off, and halt all use this per-device cleanup before continuing
+the kernel's normal shutdown sequence. The driver does not force a kernel panic
+or impose a shutdown deadline.
 
 The managed configfs pool provisions exactly one primary plane per CRTC. It
 does not create cursor or overlay planes, forcing KWin to composite the cursor,
@@ -72,6 +86,26 @@ desktop overlays, and application content into the exported framebuffer.
 Non-linear imported PRIME objects are passed through to userspace as the
 renderer GPU's original DMA-BUF; the export ioctl fails rather than silently
 copying a virtual-device shmem buffer.
+
+Native 32-bit RGB dumb buffers use a 256-byte-aligned row pitch so AMD EGL
+can import their linear DMA-BUFs at widths such as 2190, 2448, 3120, and 3440.
+Only the backing allocation is padded: the compositor keeps the requested
+width and height, and uses the pitch returned by `CREATE_DUMB` for row writes,
+mapping, and framebuffer export. The kernel helper allocates the padded size
+with its normal page alignment. Other pixel depths and imported PRIME/tiled
+buffers retain their existing allocation and layout handling. This does not
+establish that every odd-sized codec configuration is supported.
+
+`tests/linux/test-native-dumb-allocation.py linux/vibeshine-drm` compiles the
+same `vibeshine_drm_dumb.c` used by Kbuild, with mocks confined to kernel APIs.
+The test observes backing allocation requests, returned stride/size, logical
+dimensions, row writes, overflow and error handling, and PRIME registration.
+For reproducible historical red/green evidence, run
+`tests/linux/test-native-dumb-regression.py --kernel-build /path/to/kernel/build
+--output-dir /path/to/new/evidence-directory`. It compiles the complete pre-fix
+driver from Git and calls its registered allocator through the same API mocks;
+the expected failure is pitch 13760 instead of 13824 at logical 3440x1440.
+These component tests do not establish AMD EGL/VAAPI runtime behavior.
 
 Both ioctls are observational and cannot modify display state. Presentation
 waiting does not require DRM master ownership; framebuffer export requires
